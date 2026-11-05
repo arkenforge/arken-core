@@ -28,7 +28,10 @@ class ArkenCore {
             const lib = koffi.load(libPath);
             this._generate      = lib.func('int generate_challenge_into(const char *statement, char *out, int cap)');
             this._verify        = lib.func('int verify_request_into(const char *header, char *out, int cap)');
-            this._verifySigOnly = lib.func('int verify_signature_only_into(const char *header, char *out, int cap)');
+            // BREAKING (v1): gains a second 'message' argument — the canonical signed message
+            // built by the middleware from actual request fields.
+            // Rust's verify_signature_only_into must be recompiled to match.
+            this._verifySigOnly = lib.func('int verify_signature_only_into(const char *header, const char *message, char *out, int cap)');
         } catch (err) {
             throw new Error(
                 `@arkenforge/core: could not load native library at ${libPath}.\n` +
@@ -53,10 +56,17 @@ class ArkenCore {
         return this._call(this._verify, authHeader);
     }
 
-    // Crypto-only verification — nonce not checked against internal store.
-    // Caller manages nonce lifecycle (MemoryNonceStore or RedisNonceStore).
-    verifySignatureOnly(authHeader) {
-        return this._call(this._verifySigOnly, authHeader);
+    /**
+     * Verify signature only — nonce lifecycle is managed by the caller.
+     *
+     * @param {string} authHeader  – "Signature did=...,nonce=...,signature=..."
+     * @param {string} signedMessage – canonical message built by buildSignedMessage()
+     *   from actual request fields (host, method, path, bodyHash, nonce, expires).
+     *   Rust verifies the ECDSA signature against this exact string.
+     * @returns {{ status: string, did: string, nonce: string }}
+     */
+    verifySignatureOnly(authHeader, signedMessage) {
+        return this._call(this._verifySigOnly, authHeader, signedMessage);
     }
 }
 
@@ -68,49 +78,82 @@ function getCore() {
 
 // ---------------------------------------------------------------------------
 // Nonce stores
+// BREAKING (v1):
+//   set(nonce)     → now returns number (expires, Unix seconds)
+//   consume(nonce) → now returns {valid: boolean, expires: number|null}
+//     so the middleware can rebuild the signed message using the stored expiry
+//     rather than trusting a client-supplied value.
 // ---------------------------------------------------------------------------
 
-const NONCE_TTL_MS = 60_000;
+const NONCE_TTL_S = 60;
 
 class MemoryNonceStore {
     constructor() {
+        // Value stored: Unix-second expiry (number)
         this._store = new Map();
-        // Sweep expired nonces every 30 seconds
+        // Sweep expired nonces every 30 s
         this._sweep = setInterval(() => {
-            const now = Date.now();
+            const now = Math.floor(Date.now() / 1000);
             for (const [nonce, exp] of this._store) {
                 if (exp < now) this._store.delete(nonce);
             }
         }, 30_000).unref();
     }
 
+    /**
+     * Store a nonce and return its expiry as Unix seconds.
+     * @param {string} nonce
+     * @returns {Promise<number>} expires
+     */
     async set(nonce) {
-        this._store.set(nonce, Date.now() + NONCE_TTL_MS);
+        const expires = Math.floor(Date.now() / 1000) + NONCE_TTL_S;
+        this._store.set(nonce, expires);
+        return expires;
     }
 
+    /**
+     * Consume a nonce atomically (single-use).
+     * @param {string} nonce
+     * @returns {Promise<{valid: boolean, expires: number|null}>}
+     */
     async consume(nonce) {
-        const exp = this._store.get(nonce);
-        if (!exp) return false;
+        const expires = this._store.get(nonce);
+        if (expires === undefined) return { valid: false, expires: null };
         this._store.delete(nonce);
-        return exp > Date.now();
+        return { valid: Math.floor(Date.now() / 1000) < expires, expires };
     }
 }
 
 class RedisNonceStore {
-    constructor(client, ttlSeconds = 60) {
+    constructor(client, ttlSeconds = NONCE_TTL_S) {
         this._client = client;
         this._ttl = ttlSeconds;
     }
 
+    /**
+     * Store a nonce and return its expiry as Unix seconds.
+     * @param {string} nonce
+     * @returns {Promise<number>} expires
+     */
     async set(nonce) {
-        await this._client.set(`arken:nonce:${nonce}`, '1', { EX: this._ttl });
+        const expires = Math.floor(Date.now() / 1000) + this._ttl;
+        // Store the expiry value so consume() can return it.
+        await this._client.set(`arken:nonce:${nonce}`, String(expires), { EX: this._ttl });
+        return expires;
     }
 
+    /**
+     * Consume a nonce atomically — requires Redis 6.2+ for getDel.
+     * @param {string} nonce
+     * @returns {Promise<{valid: boolean, expires: number|null}>}
+     */
     async consume(nonce) {
         const key = `arken:nonce:${nonce}`;
-        // getDel is atomic — get and delete in one round trip (Redis 6.2+).
+        // getDel is atomic: get and delete in one round-trip.
         const val = await this._client.getDel(key);
-        return val !== null;
+        if (val === null) return { valid: false, expires: null };
+        const expires = parseInt(val, 10);
+        return { valid: Math.floor(Date.now() / 1000) < expires, expires };
     }
 }
 

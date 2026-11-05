@@ -85,40 +85,44 @@ fn validate_nonce(nonce: &str) -> bool {
 
 // --- DID Key Parsing ---
 
-/// Parse a did:key identifier and extract the public key
-/// Supports: did:key:z... (proper multibase format) and did:key:0x... (legacy Ethereum address format)
-fn parse_did_key(did: &str) -> Result<Address, ArkenAuthError> {
-    // Strip "did:key:" prefix
+/// Parse a did:key identifier and extract the Ethereum address plus canonical DID string.
+///
+/// Only the canonical multibase form (`did:key:z...`, base58btc-encoded) is accepted.
+/// The 0x Ethereum-address form is rejected: one key must map to exactly one DID.
+///
+/// Returns `(address, canonical_did)` where `canonical_did` is re-encoded from the
+/// extracted public key bytes, guaranteeing a stable output regardless of how the
+/// client encoded the input.
+fn parse_did_key(did: &str) -> Result<(Address, String), ArkenAuthError> {
     let key_part = did.strip_prefix("did:key:")
         .ok_or_else(|| ArkenAuthError::InvalidDidFormat("Missing 'did:key:' prefix".to_string()))?;
-    
-    // Check format: proper did:key (z-prefix) or legacy address (0x-prefix)
+
     if key_part.starts_with('z') {
-        // Proper did:key format with multibase encoding
         parse_multibase_did_key(key_part)
-    } else if key_part.starts_with("0x") {
-        // Legacy format: did:key:0xADDRESS (for Phase 1 backward compatibility)
-        parse_legacy_address_did(key_part)
     } else {
         Err(ArkenAuthError::InvalidDidFormat(
-            "DID key must start with 'z' (multibase) or '0x' (legacy address)".to_string()
+            "Only did:key:z... (multibase base58btc) is accepted; did:key:0x... is not supported".to_string()
         ))
     }
 }
 
-/// Parse proper did:key with multibase encoding (base58btc)
-fn parse_multibase_did_key(encoded: &str) -> Result<Address, ArkenAuthError> {
-    // Decode base58btc (z prefix indicates base58btc in multibase)
-    let decoded = bs58::decode(&encoded[1..]) // Skip 'z' prefix
+/// Parse a canonical did:key with multibase base58btc encoding.
+///
+/// Returns `(ethereum_address, canonical_did_string)`.
+/// The canonical DID is re-encoded from the extracted compressed public key bytes,
+/// so the output is always in the same form regardless of how the caller encoded
+/// the input (guards against capitalisation or non-minimal encoding variants).
+fn parse_multibase_did_key(encoded: &str) -> Result<(Address, String), ArkenAuthError> {
+    // Decode base58btc — skip the 'z' multibase prefix
+    let decoded = bs58::decode(&encoded[1..])
         .into_vec()
         .map_err(|e| ArkenAuthError::DidKeyDecodeError(format!("Base58 decode failed: {}", e)))?;
-    
-    // Check minimum length (multicodec + at least some key data)
+
     if decoded.len() < 3 {
         return Err(ArkenAuthError::DidKeyDecodeError("Decoded data too short".to_string()));
     }
-    
-    // Verify multicodec (0xe7 0x01 for secp256k1-pub compressed)
+
+    // Verify multicodec prefix: 0xe7 0x01 = secp256k1-pub compressed
     if decoded.len() < SECP256K1_MULTICODEC.len() || &decoded[..SECP256K1_MULTICODEC.len()] != SECP256K1_MULTICODEC {
         let codec = if decoded.len() >= 2 {
             ((decoded[0] as u16) << 8) | (decoded[1] as u16)
@@ -127,33 +131,31 @@ fn parse_multibase_did_key(encoded: &str) -> Result<Address, ArkenAuthError> {
         };
         return Err(ArkenAuthError::UnsupportedKeyType(codec));
     }
-    
-    // Extract public key bytes (33 bytes for compressed secp256k1)
+
+    // Extract the 33-byte compressed public key
     let key_bytes = &decoded[SECP256K1_MULTICODEC.len()..];
     if key_bytes.len() != 33 {
         return Err(ArkenAuthError::InvalidPublicKey);
     }
-    
-    // Convert compressed public key to Ethereum address
-    // Ethereum address = last 20 bytes of keccak256(uncompressed_public_key)
+
+    // Derive Ethereum address: last 20 bytes of keccak256(uncompressed_key)
     let verifying_key = VerifyingKey::from_sec1_bytes(key_bytes)
         .map_err(|_| ArkenAuthError::InvalidPublicKey)?;
-    
-    // Get uncompressed public key (64 bytes, no prefix)
-    let uncompressed = verifying_key.to_encoded_point(false);
-    let uncompressed_bytes = &uncompressed.as_bytes()[1..]; // Skip 0x04 prefix
-    
-    // Hash and take last 20 bytes for Ethereum address
-    let hash = keccak256(uncompressed_bytes);
-    let address_bytes: [u8; 20] = hash[12..].try_into().unwrap();
-    
-    Ok(Address::from(address_bytes))
-}
 
-/// Parse legacy format: did:key:0xADDRESS (Phase 1 backward compatibility)
-fn parse_legacy_address_did(address_str: &str) -> Result<Address, ArkenAuthError> {
-    address_str.parse::<Address>()
-        .map_err(|_| ArkenAuthError::InvalidDidFormat("Invalid Ethereum address".to_string()))
+    let uncompressed       = verifying_key.to_encoded_point(false);
+    let uncompressed_bytes = &uncompressed.as_bytes()[1..]; // skip 0x04 prefix
+    let hash               = keccak256(uncompressed_bytes);
+    let address_bytes: [u8; 20] = hash[12..].try_into().unwrap();
+    let address = Address::from(address_bytes);
+
+    // Re-encode to canonical DID — deterministic from key_bytes.
+    // This normalises any non-canonical encoding the client may have sent.
+    let mut canonical_payload = Vec::with_capacity(SECP256K1_MULTICODEC.len() + key_bytes.len());
+    canonical_payload.extend_from_slice(SECP256K1_MULTICODEC);
+    canonical_payload.extend_from_slice(key_bytes);
+    let canonical_did = format!("did:key:z{}", bs58::encode(canonical_payload).into_string());
+
+    Ok((address, canonical_did))
 }
 
 // --- Signature Verification ---
@@ -179,42 +181,53 @@ fn parse_auth_header(auth_header: &str) -> Result<(String, String, String), Arke
     Ok((did, nonce, signature_hex))
 }
 
-fn verify_signature(did: &str, nonce: &str, signature_hex: &str) -> Result<(), ArkenAuthError> {
-    let expected_address = parse_did_key(did)?;
+/// Verify an ECDSA signature against an arbitrary message.
+///
+/// Returns the canonical DID string on success (re-encoded from the public key).
+/// `message` is the canonical signed message built by `buildSignedMessage()`.
+fn verify_signature(did: &str, message: &str, signature_hex: &str) -> Result<String, ArkenAuthError> {
+    let (expected_address, canonical_did) = parse_did_key(did)?;
 
     let sig: Signature = signature_hex.parse()
         .map_err(|_| ArkenAuthError::InvalidSignatureFormat)?;
 
-    let recovered_address = sig.recover(nonce.as_bytes())
+    // Ethereum personal-sign: same scheme used by the client (eth_sign / signMessage).
+    let recovered_address = sig.recover(message.as_bytes())
         .map_err(|_| ArkenAuthError::SignatureRecoveryError)?;
 
     if to_checksum(&recovered_address, None) != to_checksum(&expected_address, None) {
         return Err(ArkenAuthError::SignatureMismatch);
     }
 
-    Ok(())
+    Ok(canonical_did)
 }
 
 async fn verify_logic(auth_header: &str) -> Result<String, ArkenAuthError> {
     let (did, nonce, signature_hex) = parse_auth_header(auth_header)?;
 
-    // Validate nonce against internal store
     if !validate_nonce(&nonce) {
         return Err(ArkenAuthError::InvalidNonce);
     }
 
-    verify_signature(&did, &nonce, &signature_hex)?;
+    // Legacy path: sign just the nonce (no audience binding).
+    // Kept for internal tooling only; prefer verify_signature_only_logic.
+    let canonical_did = verify_signature(&did, &nonce, &signature_hex)?;
 
-    Ok(did)
+    Ok(canonical_did)
 }
 
 /// verify_signature_only: crypto verification without internal nonce check.
-/// Used when Node.js manages the nonce store (e.g. Redis adapter).
+///
+/// `signed_message` is the canonical message built by `buildSignedMessage()` in
+/// the middleware/client — it already contains host, method, path, body hash,
+/// nonce, and expiry.  Rust verifies the signature against that exact string.
+///
 /// Returns { status, did, nonce } on success so the caller can consume the nonce.
-async fn verify_signature_only_logic(auth_header: &str) -> Result<(String, String), ArkenAuthError> {
+async fn verify_signature_only_logic(auth_header: &str, signed_message: &str) -> Result<(String, String), ArkenAuthError> {
     let (did, nonce, signature_hex) = parse_auth_header(auth_header)?;
-    verify_signature(&did, &nonce, &signature_hex)?;
-    Ok((did, nonce))
+    // verify_signature returns the canonical DID re-encoded from the public key bytes.
+    let canonical_did = verify_signature(&did, signed_message, &signature_hex)?;
+    Ok((canonical_did, nonce))
 }
 
 // --- FFI Layer ---
@@ -270,10 +283,16 @@ pub extern "C" fn verify_request_into(
 }
 
 /// Verify signature only — no internal nonce check.
-/// Returns { status, did, nonce } so Node.js can consume the nonce from its own store.
+///
+/// BREAKING (v1): gains a second `message` parameter — the canonical signed
+/// message built by the middleware from actual request fields.
+/// Callers must recompile after this change.
+///
+/// Returns { status, did, nonce } so the caller can consume the nonce from its store.
 #[no_mangle]
 pub extern "C" fn verify_signature_only_into(
     auth_header_ptr: *const c_char,
+    message_ptr: *const c_char,
     out: *mut c_char,
     cap: usize,
 ) -> i32 {
@@ -285,7 +304,15 @@ pub extern "C" fn verify_signature_only_into(
         }
     };
 
-    let result = RT.block_on(verify_signature_only_logic(auth_header));
+    let signed_message = match unsafe { CStr::from_ptr(message_ptr).to_str() } {
+        Ok(s) => s,
+        Err(_) => {
+            let msg = json!({"status": "error", "message": "Invalid UTF-8 in message"}).to_string();
+            return unsafe { write_to_buf(&msg, out, cap) };
+        }
+    };
+
+    let result = RT.block_on(verify_signature_only_logic(auth_header, signed_message));
 
     let response = match result {
         Ok((did, nonce)) => json!({"status": "success", "did": did, "nonce": nonce}),
