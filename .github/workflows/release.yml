@@ -36,9 +36,11 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
+      # Stages the version on npm without making it public. A maintainer then publishes it
+      # with 2FA: `npm stage list @arkenforge/core` and `npm stage approve <stage-id>`.
       # Uses trusted publishing (OIDC) once it is configured for this package on npmjs.com.
-      # NPM_BOOTSTRAP_TOKEN is only for the very first publish, before the package exists;
+      # NPM_BOOTSTRAP_TOKEN is only for the very first release, before the package exists;
       # it is deliberately not named NPM_TOKEN so it can never fall back to the old repo secret.
-      - run: npm publish --provenance --access public
+      - run: npm stage publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}
