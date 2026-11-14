@@ -1,0 +1,50 @@
+{
+  "name": "@arkenforge/core",
+  "version": "1.0.0",
+  "description": "Per-agent limits and a kill switch for MCP servers, using the auth you already have.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "agents",
+    "rate-limit",
+    "revocation",
+    "kill-switch"
+  ],
+  "license": "Apache-2.0",
+  "author": "ArkenForge",
+  "homepage": "https://github.com/arkenforge/arken-core#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/arkenforge/arken-core.git"
+  },
+  "bugs": {
+    "url": "https://github.com/arkenforge/arken-core/issues"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "npm run build && tsc --noEmit",
+    "test": "npm run build && node --test",
+    "prepublishOnly": "npm run typecheck && npm test",
+    "example": "npm run build && node --experimental-strip-types --no-warnings examples/mcp-server/server.ts",
+    "example:client": "node --experimental-strip-types --no-warnings examples/mcp-server/client.ts"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@types/node": "20.19.43",
+    "typescript": "5.9.3",
+    "zod": "4.6.7"
+  }
+}

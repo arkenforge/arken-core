@@ -1,0 +1,4 @@
+# Revoked agents, one per line: a raw agent ID (here, the clientId your auth sets)
+# or the hashed `agent` value copied from a log line. Picked up within 60 seconds.
+#
+# agent-beta

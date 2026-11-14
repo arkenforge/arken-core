@@ -2,122 +2,43 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v1.*']
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  # ── Build native binaries for all platforms ────────────────────────────────
-  build-binaries:
-    name: Build ${{ matrix.platform }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux-x64
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            binary: libarken_core.so
-
-          - platform: linux-arm64
-            os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            binary: libarken_core.so
-            use-cross: true
-
-          - platform: darwin-x64
-            os: macos-latest
-            target: x86_64-apple-darwin
-            binary: libarken_core.dylib
-
-          - platform: darwin-arm64
-            os: macos-latest
-            target: aarch64-apple-darwin
-            binary: libarken_core.dylib
-
-          - platform: win32-x64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary: arken_core.dll
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install cross (Linux ARM64)
-        if: matrix.use-cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Build (cross)
-        if: matrix.use-cross
-        run: cross build --release --target ${{ matrix.target }}
-        working-directory: rust
-
-      - name: Build (native)
-        if: '!matrix.use-cross'
-        run: cargo build --release --target ${{ matrix.target }}
-        working-directory: rust
-
-      - name: Copy binary into platform package
-        shell: bash
-        run: |
-          mkdir -p "packages/@arkenforge/core-${{ matrix.platform }}/bin"
-          cp "rust/target/${{ matrix.target }}/release/${{ matrix.binary }}" \
-             "packages/@arkenforge/core-${{ matrix.platform }}/bin/"
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: binary-${{ matrix.platform }}
-          path: packages/@arkenforge/core-${{ matrix.platform }}/bin/
-          retention-days: 1
-
-  # ── Publish all packages to npm ───────────────────────────────────────────
   publish:
     name: Publish to npm
-    needs: build-binaries
     runs-on: ubuntu-latest
+    # Requires approval from a reviewer configured on the environment.
+    environment: production
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing and provenance
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: '20'
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22.x'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Download all binaries
-        uses: actions/download-artifact@v4
-        with:
-          pattern: binary-*
-          path: artifacts/
+      # Trusted publishing needs npm >= 11.5.1; Node 22 ships npm 10.
+      - run: npm install -g npm@11.21.1
 
-      - name: Place binaries into platform packages
-        run: |
-          for platform in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
-            mkdir -p "packages/@arkenforge/core-${platform}/bin"
-            cp "artifacts/binary-${platform}/"* "packages/@arkenforge/core-${platform}/bin/"
-          done
+      - name: Tag matches package.json version
+        run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
 
-      - name: Publish platform packages
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+      # Uses trusted publishing (OIDC) once it is configured for this package on npmjs.com.
+      # NPM_BOOTSTRAP_TOKEN is only for the very first publish, before the package exists;
+      # it is deliberately not named NPM_TOKEN so it can never fall back to the old repo secret.
+      - run: npm publish --provenance --access public
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          for platform in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
-            cd "packages/@arkenforge/core-${platform}"
-            npm publish --access public 2>&1 | tee /tmp/npm-out.txt || grep -q "cannot publish over" /tmp/npm-out.txt || exit 1
-            cd ../../..
-          done
-
-      - name: Publish @arkenforge/core
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          cd packages/@arkenforge/core
-          npm publish --access public 2>&1 | tee /tmp/npm-out.txt || grep -q "cannot publish over" /tmp/npm-out.txt || exit 1
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}
