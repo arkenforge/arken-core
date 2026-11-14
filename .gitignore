@@ -1,31 +1,5 @@
-# Rust
-target/
-**/*.rs.bk
-
-# Node
 node_modules/
-*.log
-npm-debug.log*
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
 dist/
-build/
-.venv/
-venv/
-
-# Compiled binaries
-bin/
-*.so
-*.dylib
-*.dll
-
-# Docker build artifacts
-*.tar.gz
-
-# OS
+*.log
+*.tgz
 .DS_Store
-Thumbs.db

@@ -1,105 +1,197 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/arken-banner-dark.svg">
-    <img src=".github/assets/arken-banner-light.svg" alt="ArkenForge — Identity infrastructure for AI agents." width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/arken-stone-dark.svg">
+    <img src=".github/assets/arken-stone-light.svg" alt="The Arken stone" width="120">
   </picture>
 </p>
 
+<h1 align="center">arken-core</h1>
+
 <p align="center">
-  The cryptographic core of ArkenForge. ECDSA signature verification, <code>did:key</code> identity, nonce generation.
+  Per-agent limits and a kill switch for MCP servers, using the auth you already have.
 </p>
 
 <p align="center">
-  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License: Apache 2.0"></a>
-  <a href="https://github.com/ArkenForge/arken-core/actions/workflows/release.yml"><img src="https://github.com/ArkenForge/arken-core/actions/workflows/release.yml/badge.svg" alt="Release"></a>
+  <a href="https://www.npmjs.com/package/@arkenforge/core"><img src="https://img.shields.io/npm/v/@arkenforge/core.svg" alt="npm"></a>
+  <a href="https://github.com/arkenforge/arken-core/actions/workflows/ci.yml"><img src="https://github.com/arkenforge/arken-core/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License: Apache 2.0"></a>
 </p>
 
 ---
 
-## What this is
+When several agents call your MCP server under one account or one API key, per-user and
+per-IP controls can't tell them apart. arken-core wraps your tool handlers and gives
+**each agent** its own:
 
-`arken-core` is the Rust library that everything in ArkenForge builds on. It handles:
+- **Log line**: one JSON line per call, naming the agent (hashed), the tool and the decision inputs.
+- **Rate limit**: per agent, not per user or IP, so one loop can't drain everyone's quota.
+- **Kill switch**: put one agent on a deny list and it's cut off within 60 seconds. Nobody else is signed out.
 
-- **Challenge generation** — cryptographically random nonces with 60s TTL
-- **Signature verification** — ECDSA secp256k1 via [ethers-rs](https://github.com/gakonst/ethers-rs)
-- **DID parsing** — `did:key` identity using the W3C spec (`zQ3s…` prefix for secp256k1)
+It is **observe-only by default**: it logs what it *would* block and blocks nothing until you
+switch enforcement on for a specific agent. If arken-core itself fails, the call goes through untouched.
 
-It compiles to a native shared library (`.dylib` / `.so` / `.dll`) loaded by higher-level packages via FFI.
+It runs in your process, on your auth. It adds no runtime dependencies, sends nothing anywhere
+and holds no credentials.
 
-## Build
-
-Requires [Rust](https://rustup.rs).
+## Install
 
 ```bash
-cd rust
-cargo build --release
+npm install @arkenforge/core
 ```
 
-Output: `rust/target/release/libarken_core.{dylib,so,dll}`
+Node 20.19 or later. TypeScript types included. Works with the
+[official TypeScript MCP SDK](https://github.com/modelcontextprotocol/typescript-sdk) and
+anything else that calls tool handlers as `(args, extra)` or `(extra)`.
 
-## C API
+## Quick start
 
-Three C-compatible functions are exported:
+```ts
+import { createArken, fromClientId } from '@arkenforge/core';
 
-```c
-int generate_challenge_into(const char *statement, char *out, int cap);
-int verify_request_into(const char *header, char *out, int cap);
-int verify_signature_only_into(const char *header, char *out, int cap);
+const arken = createArken({
+  identify: fromClientId(),             // who the agent is, from your existing auth
+  secret: process.env.ARKEN_SECRET,     // keys the agent hashes in your logs
+  denyList: './revoked.txt',            // your kill switch
+  rateLimit: { limit: 60, windowS: 60 },
+});
+
+server.registerTool(
+  'search_docs',
+  { description: 'Search the docs', inputSchema: { query: z.string() } },
+  arken.wrap('search_docs', async ({ query }) => {
+    // your handler, unchanged
+  }),
+);
 ```
 
-All functions write JSON into `out` and return the number of bytes written, or `-1` on buffer overflow.
+Create one `arken` per process and wrap each tool. A runnable server and client are in
+[`examples/mcp-server`](examples/mcp-server).
 
-## How it works
+## How it identifies agents
 
-An unsigned request gets a `401` with a one-time nonce. The client signs the nonce with its secp256k1 private key and retries with an `Authorization: Signature` header. The core verifies the ECDSA signature, checks the nonce, and returns the agent's `did:key` — nothing stored, nothing breached.
+arken-core never authenticates anyone. Your auth already did that and put the result on
+`extra.authInfo`. arken-core reads a **stable** ID from it:
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant S as Server
-    C->>S: GET /protected
-    S-->>C: 401 { challenge: { nonce, statement } }
-    Note over C: sign(nonce, privateKey)
-    C->>S: GET /protected<br/>Authorization: Signature did="…",nonce="…",signature="…"
-    S-->>C: 200 { did: "did:key:zQ3s…" }
+| Helper | Reads | Use when |
+|---|---|---|
+| `fromClientId()` *(default)* | `authInfo.clientId` | OAuth client IDs, or your verifier sets the API key's ID here |
+| `fromClaim('sub')` | `authInfo.extra.sub` | your verifier copies token claims onto `authInfo.extra` |
+| `fromApiKeyId('keyId')` | `authInfo.extra.keyId` | API keys with a separate key ID |
+| `(extra) => string \| undefined` | anything | none of the above |
+
+The ID is hashed (HMAC-SHA256 when `secret` is set) and the hash is what you see in logs. Because
+it comes from the client or key ID and not the token, it stays the same when tokens are reissued,
+so a revoked agent can't come back as a stranger with a fresh token.
+
+Calls with no identity are logged with `"agent": null` and are never limited or blocked.
+
+## The decision log
+
+One line per call, on **stderr** by default (stdout is the protocol channel on stdio servers):
+
+```json
+{"ts":"2026-11-14T21:14:34.895Z","agent":"66bca028f6bdeb663cfca3c84c97ad6a","tool":"search_docs","decision_inputs":{"revoked":false,"count":6,"limit":5,"window_s":60},"would_block":true,"duration_ms":0.41}
 ```
 
-## Identity: `did:key`
-
-Each agent gets a [W3C DID Key](https://w3c-ccg.github.io/did-method-key/) derived from its key pair:
-
-```
-did:key:zQ3shXgnkuyqVxf3NGBsK1q3J…
-```
-
-The `zQ3s…` prefix indicates secp256k1 (`0xe7 0x01` multicodec). Same key, same DID, across every server running Arken. One identity, every tool.
-
-## ArkenForge ecosystem
-
-| Repo | What it is |
+| Field | Meaning |
 |---|---|
-| **arken-core** (this repo) | Rust crypto core — the foundation |
-| [arken-auth](https://github.com/arkenforge/arken-auth) | Express + FastAPI middleware, client SDKs, MCP integration |
-| [arken-registry](https://github.com/arkenforge/arken-registry) | Discovery registry — find APIs that accept Arken auth |
-| [arken-verifier](https://github.com/arkenforge/arken-verifier) | Hosted verifier — metered signature verification |
+| `ts` | ISO 8601 time of the call |
+| `agent` | Hashed agent ID, or `null` if the call had none |
+| `tool` | The name you passed to `wrap` |
+| `decision_inputs.revoked` | The agent is on the deny list |
+| `decision_inputs.count` | This agent's calls in the current window, including this one |
+| `decision_inputs.limit`, `window_s` | The limit in force |
+| `would_block` | `revoked`, or `count > limit` |
+| `duration_ms` | Time spent in your handler |
 
-## Status
+**Never logged:** tool arguments, results, tokens, scopes, claims, raw agent IDs, the secret.
+The line is built field by field, so nothing else can reach it. Send it elsewhere with
+`log: (line) => myLogger.info(line)`.
 
-- **Not production-ready.** Early-stage project.
-- **Nonces are in memory.** Won't survive restarts or work across multiple instances without a shared store.
-- **No key recovery.** Losing the private key means losing access.
-- **Rust toolchain required to build.** Prebuilt binaries are on the 1.0 roadmap.
+## Observe, then enforce
+
+1. **Wrap your handlers.** Everything is logged, nothing is blocked.
+2. **Watch for a week.** Filter for `"would_block":true` to see who your limits would have hit.
+3. **Enforce on one agent** when the data says you're ready:
+
+```ts
+createArken({ /* ... */ enforce: ['agent-7f3a'] });   // raw IDs or hashes from the log
+createArken({ /* ... */ enforce: (agent) => true });  // or everyone
+```
+
+An enforced call that would block doesn't reach your handler. The client gets an MCP error result
+(`isError: true`) saying it was revoked or rate limited. **Revocation follows the same rule**:
+a revoked agent in observe-only mode is logged with `"would_block": true` and still runs.
+
+## The kill switch
+
+`denyList` is a plain text file, one agent per line, `#` for comments. An entry can be the raw ID
+your auth uses or the `agent` hash copied from a log line:
+
+```text
+# revoked 2026-11-14: runaway loop, ticket #412
+agent-7f3a
+66bca028f6bdeb663cfca3c84c97ad6a
+```
+
+It is checked at most once a minute, during a call, so changes apply within 60 seconds with no
+restart. If the file goes missing or can't be read, the last good list stays in force.
+
+## Options
+
+| Option | Default | |
+|---|---|---|
+| `identify` | `fromClientId()` | How to find the agent on a call |
+| `secret` | none | HMAC key for agent hashes. Set it: without one, low-entropy IDs could be guessed from their hashes |
+| `denyList` | none | Path to the revocation file |
+| `rateLimit` | `{ limit: 60, windowS: 60 }` | Fixed window, per agent, shared across tools |
+| `enforce` | none (observe-only) | Agents to enforce on: IDs, hashes, or a predicate on the hash |
+| `log` | stderr | Receives each JSON line |
+| `onError` | short note on stderr | Receives arken-core's own errors (the call goes through regardless) |
+
+## Fails open
+
+Everything arken-core does runs inside `try/catch`. If identifying the agent, reading the deny
+list, counting or logging throws, your handler runs exactly once with its original arguments
+and its result is returned as-is. Errors from your own handler propagate unchanged.
+Removing arken-core means unwrapping your handlers.
+
+## Limits of 1.0
+
+- Counts are **in memory, per process**. Behind a load balancer each replica counts on its own.
+- TypeScript / Node only.
+- No write or payment rules, no per-agent spend caps yet.
+
+## What changed and why
+
+Until November 2026 this repository was a different project: a Rust library that verified
+requests signed with self-issued `did:key` (secp256k1) identities, loaded into Node and Python
+through native bindings.
+
+We stopped because market research changed the brief. Operators only trust identities they
+issue or choose themselves, so an agent-held key that no one vouches for doesn't help them. And
+where agents do sign requests, the industry has settled on
+[RFC 9421 HTTP Message Signatures](https://www.rfc-editor.org/rfc/rfc9421) with Ed25519, not a
+bespoke scheme. What operators were missing wasn't a new identity. It was a way to tell apart and
+control the agents behind the identities they already have. (For context on how public MCP
+servers authenticate today, see our
+[survey of 34K endpoints](https://github.com/arkenforge/mcp-auth-survey).)
+
+So 1.0 drops its own crypto, its Rust core and its native binaries, and works on top of your auth.
+The old packages (`@arkenforge/arken-auth`, `arken-auth`, `arken-client` and the PyPI packages)
+are retired. Their code is preserved:
+
+- [`legacy`](https://github.com/arkenforge/arken-core/tree/legacy) branch and
+  [`v0-did-key`](https://github.com/arkenforge/arken-core/tree/v0-did-key) tag: the Rust core.
+- [`v0-arken-auth`](https://github.com/arkenforge/arken-core/tree/v0-arken-auth) tag: the
+  Express and FastAPI middleware and the JS and Python clients.
+
+They are unmaintained and have known security issues. Don't deploy them.
 
 ## Security
 
-See [SECURITY.md](SECURITY.md). Find a flaw, open a private advisory, and your name goes in the Hall of Finders.
-
-## Join the 1.0 waitlist
-
-**Founding Builders** — everyone who joins before December 15, 2026 — are credited by name in the 1.0 README. There are **10 design-partner slots** for teams who want to shape the API directly.
-
-[Join the waitlist](https://tally.so/r/kbbjWR)
+See [SECURITY.md](SECURITY.md).
 
 ## License
 
-[Apache 2.0](LICENSE) — ArkenForge
+[Apache 2.0](LICENSE) © ArkenForge
